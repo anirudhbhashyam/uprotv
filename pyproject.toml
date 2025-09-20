@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uprotv"
+version = "0.1.0"
+description = "A collection of CLI tools in a convenient CLI that lets you do routine protein design tasks."
+dependencies = [
+    "click",
+]
+requires-python = ">=3.13"
+
+[project.scripts]
+uprotv = "uprotv.cli:main"
