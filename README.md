@@ -59,6 +59,12 @@ design:
 The motif is optional and can be ommited if all residues in the binder need to be designed. The motif argument works similarly to what is seen in [`RFdiffusion`](https://github.com/RosettaCommons/RFdiffusion).
 
 
+### `generate-config-from-rfdiffusion-run`
+
+Generate a config file from a RFdiffusion run. The command will generate a `yaml` file based on a provided input directory containing backbones from RFdiffusion.
+
+
+
 
 
 
