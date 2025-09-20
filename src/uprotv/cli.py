@@ -36,7 +36,7 @@ def _add_commands() -> None:
                         if "--help" in script_args:
                             command = ["uv", "run", path, "--help"]
                         else:
-                            command = ["uv", "run", path, "--"] + list(script_args)
+                            command = ["uv", "run", path] + list(script_args)
                         subprocess.check_call(command)
                     except FileNotFoundError:
                         click.echo("Error: 'uv' command not found. Is uv installed and discoverable?", err = True)

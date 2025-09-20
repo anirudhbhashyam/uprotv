@@ -107,7 +107,9 @@ def main(
                 },
             }
         )
-    OmegaConf.save(config, input_path / "config.yaml")
+    save_filepath = input_path / "config.yaml"
+    OmegaConf.save(config, save_filepath)
+    click.echo(f"Config saved to {save_filepath}")
 
 
 if __name__ == "__main__":
