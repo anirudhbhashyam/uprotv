@@ -234,11 +234,7 @@ def worker(
 
 @click.command(short_help = "Run AF2 binder evaluation with ProteinMPNN sequence design.")
 @click.argument("config-filepath", type = Path)
-@click.option("--num-workers", "-nw", type = int, default = 2, help = "The number of worker processes.")
-def main(
-    config_filepath: Path,
-    num_workers: int,
-) -> int:
+def main(config_filepath: Path) -> int:
     setup_af2_params()
     config = OmegaConf.load(config_filepath)
     tracker = progress.Progress(
