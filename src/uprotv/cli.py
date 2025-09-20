@@ -34,7 +34,7 @@ def _add_commands() -> None:
                 def _runner(script_args: tuple[Any]) -> None:
                     try:
                         if "--help" in script_args:
-                            command = ["uv", "run", path]
+                            command = ["uv", "run", path, "--help"]
                         else:
                             command = ["uv", "run", path, "--"] + list(script_args)
                         subprocess.check_call(command)
