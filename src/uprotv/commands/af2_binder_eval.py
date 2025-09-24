@@ -20,7 +20,6 @@ from colabdesign.af.alphafold.common import residue_constants
 from colabdesign.shared.utils import clear_mem
 from colabdesign.af.loss import get_pae_loss
 
-
 import functools
 
 import jax
@@ -44,6 +43,8 @@ from proteinbee.motif import Motif
 from rich import progress
 
 import subprocess
+
+from typing import Any
 
 
 def setup_af2_params() -> None:
@@ -85,22 +86,7 @@ def setup_af2_params() -> None:
     (path / "alphafold_params_2022-12-06.tar").unlink(missing_ok = True)
 
 
-def _predict_structure(
-    model: mk_afdesign_model,
-    seq: jnp.ndarray,
-) -> dict[str, float]:
-    model._cfg.global_config = model._cfg.model.global_config
-    model._params["seq"] = seq
-    model._inputs["bias"] = jnp.zeros(seq.shape[1 :])
-    model.set_opt(hard = True, soft = False, temp = 1, dropout = False, pssm_hard = True)
-    model.set_args(shuffle_first = False)
-    model._inputs["opt"] = model.opt
-    loss, aux = model._model["fn"](
-        model._params,
-        model._model_params[0],
-        model._inputs,
-        model.key(),
-    )
+def _process_metrics_from_aux(aux: dict[str, Any]) -> dict[str, float | None]:
     return {
         "plddt": aux["plddt"].mean(-1),
         "pae": aux["pae"].mean(),
@@ -111,7 +97,91 @@ def _predict_structure(
     }
 
 
-_parallel_predict_structure = jax.vmap(_predict_structure, in_axes = (None, 0))
+def _predict_structure(
+    model: mk_afdesign_model,
+    seq: jnp.ndarray,
+    backprop: bool = False,
+) -> dict[str, Any]:
+    model._cfg.global_config = model._cfg.model.global_config
+    model._params["seq"] = seq
+    model._inputs["bias"] = jnp.zeros(seq.shape[1 :])
+    model.set_opt(hard = True, soft = False, temp = 1, dropout = False, pssm_hard = True)
+    model.set_args(shuffle_first = False)
+    model._inputs["opt"] = model.opt
+    if backprop:
+        (loss, aux), grad = model._model["grad_fn"](
+            model._params,
+            model._model_params[0],
+            model._inputs,
+            model.key(),
+        )
+    else:
+        loss, aux = model._model["fn"](
+            model._params,
+            model._model_params[0],
+            model._inputs,
+            model.key(),
+        )
+        grad = jax.tree_util.tree_map(jnp.zeros_like, model._params)
+    aux.update({"grad": grad, "loss": loss})
+    return aux
+
+
+def _recycle(model: mk_afdesign_model, seq: jnp.ndarray, num_recycles: int = 3):   
+    a = model._args 
+    mode = a["recycle_mode"]
+    
+    L = model._inputs["residue_index"].shape[0]
+      
+    if "prev" not in model._inputs or a["clear_prev"]:
+        prev = {
+            "prev_msa_first_row": np.zeros((L, 256)),
+            "prev_pair": np.zeros((L, L, 128))
+        }
+
+        if a["use_initial_guess"] and "batch" in model._inputs:
+            prev["prev_pos"] = model._inputs["batch"]["all_atom_positions"] 
+        else:
+            prev["prev_pos"] = np.zeros((L, 37, 3))
+
+        if a["use_dgram"]:
+            prev["prev_dgram"] = np.zeros((L, L, 64))
+
+        if a["use_initial_atom_pos"]:
+            if "batch" in model._inputs:
+                model._inputs["initial_atom_pos"] = model._inputs["batch"]["all_atom_positions"] 
+            else:
+                model._inputs["initial_atom_pos"] = np.zeros((L, 37, 3))              
+      
+    model._inputs["prev"] = prev
+
+    cycles = (num_recycles + 1)
+    mask = [0] * cycles
+
+    if mode == "sample":  mask[jnp.random.randint(0, cycles)] = 1
+    if mode == "average": mask = [1 / cycles] * cycles
+    if mode == "last":    mask[-1] = 1
+    if mode == "first":   mask[0] = 1
+      
+    grad = []
+    for m in mask:
+        if m == 0:
+            aux = _predict_structure(model, seq)
+        else:
+            aux = _predict_structure(model, seq, backprop = True)
+            grad.append(jax.tree_util.tree_map(lambda x: x * m, aux["grad"]))
+        model._inputs["prev"] = aux["prev"]
+        if a["use_initial_atom_pos"]:
+            model._inputs["initial_atom_pos"] = aux["prev"]["prev_pos"]                
+    # Final gradient tensor not required.
+    # aux["grad"] = jax.tree_util.tree_map(lambda *x: jnp.stack(x).sum(0), *grad)
+    return _process_metrics_from_aux(aux)
+
+
+_parallel_predict_structure = jax.jit(
+    jax.vmap(_recycle, in_axes = (None, 0, None)),
+    static_argnames = ("model", "num_recycles"),
+)
 
 
 def _prepare_seq_for_af2(seq: str) -> jnp.ndarray:
@@ -122,6 +192,12 @@ def _prepare_seq_for_af2(seq: str) -> jnp.ndarray:
         s_ = s_.at[s == -1].set(0)
         return s_
     return s
+
+
+def _process_batch_results(batch_results: dict[str, jax.Array], prefix: str | None = None) -> dict[str, np.ndarray]:
+    if prefix is None:
+        return {k: np.array(v) for k, v in batch_results.items() if v is not None}
+    return {f"{prefix}_{k}": np.array(v) for k, v in batch_results.items() if v is not None}
 
 
 def worker(
@@ -190,23 +266,23 @@ def worker(
         [_prepare_seq_for_af2(s.split("/")[binder_seq_pos]) for s in samples["seq"]]
     )
     names = [f"{design_name}_seq_{i}" for i in range(len(binder_seqs))]
-    batch_results = {
-        k: np.array(v)
-        for k, v in _parallel_predict_structure(
+    batch_results = _process_batch_results(
+        _parallel_predict_structure(
             af2_binder_model,
             binder_seqs,
-        ).items()
-        if v is not None
-    }
-    batch_monomer_results = {
-        f"binder_{k}": np.array(v)
-        for k, v in _parallel_predict_structure(
+            3,
+        )
+    )
+    batch_monomer_results = _process_batch_results(
+        _parallel_predict_structure(
             af2_monomer_model,
             binder_seqs,
-        ).items()
-        if v is not None
-    }
-    lf = (
+            3,
+        ),
+        prefix = "binder",
+    )
+
+    return (
         pl.concat(
             [
                 pl.LazyFrame(batch_results),
@@ -227,9 +303,7 @@ def worker(
             *batch_monomer_results.keys(),
         )
     )
-    af2_binder_model.restart()
-    af2_monomer_model.restart()
-    return lf
+
 
 
 @click.command(short_help = "Run AF2 binder evaluation with ProteinMPNN sequence design.")
@@ -278,9 +352,11 @@ def main(config_filepath: Path) -> int:
             af2_monomer_model = af2_monomer_model,
         )
         for result in (func(w) for w in work):
-            if result is not None:
+            if result is not None:  
                 final_results.append(result)
                 tracker.update(task, advance = 1)
+            af2_binder_model.restart()
+            af2_monomer_model.restart()
     pl.concat(final_results).sink_parquet(save_path / "metrics.parquet")
     return 0
 
