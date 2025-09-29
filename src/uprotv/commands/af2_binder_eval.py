@@ -2,6 +2,7 @@
 # requires-python = ">=3.13"
 # dependencies = [
 #     "click",
+#     "deltalake",
 #     "flax",
 #     "jax[cuda12]<0.6.0",
 #     "omegaconf",
@@ -170,16 +171,16 @@ def worker(
     ]
     names = [f"{design_name}_seq_{i}" for i in range(len(binder_seqs))]
     results = []
-    for seq in binder_seqs:
+    for name, seq in zip(names, binder_seqs):
         af2_binder_model.predict(
             seq,
-            num_recycles = 3,
-            model_nums = [0, 1],
+            num_recycles = config["af2"]["num_recycles"],
+            model_nums = config["af2"]["model_nums"],
             verbose = False,
         )
         af2_monomer_model.predict(
             seq,
-            num_recycles = 3,
+            num_recycles = config["af2"]["num_recycles"],
             model_nums = [0, 3],
             verbose = False,
         )
@@ -197,7 +198,11 @@ def worker(
                 "binder_rmsd": af2_monomer_model.aux["log"]["rmsd"],
             }
         )
-    return pl.LazyFrame(results).with_columns(name = pl.Series(names))
+        af2_binder_model.save_pdb(save_path / f"{name}.pdb")
+    return pl.LazyFrame(results).with_columns(
+        name = pl.Series(names),
+        seq = pl.Series(samples["seq"]),
+    )
 
 
 @click.command(short_help = "Run AF2 binder evaluation with ProteinMPNN sequence design.")
@@ -223,7 +228,6 @@ def main(config_filepath: Path) -> int:
         )
         for design_name, design_data in design_tasks.items()
     )
-    final_results = []
     save_path = Path(config["design"]["store_path"]).resolve().joinpath("af2_binder")
     if not save_path.exists():
         save_path.mkdir(parents = True)
@@ -236,23 +240,32 @@ def main(config_filepath: Path) -> int:
         use_initial_guess = True,
     )
     af2_monomer_model = mk_afdesign_model(protocol = "fixbb", data_dir = params_path)
+    save_every_n_iterations = 10
+    final_results = []
+    func = functools.partial(
+        worker,
+        config = config,
+        save_path = save_path,
+        mpnn_model = mpnn_model,
+        af2_binder_model = af2_binder_model,
+        af2_monomer_model = af2_monomer_model,
+    )
+    results_iter = (func(w) for w in work)
+    metrics_save_filepath = save_path / "metrics.delta"
     with tracker:
         task = tracker.add_task("MPNN and AF2 evaluation", total = n_design_tasks)
-        func = functools.partial(
-            worker,
-            config = config,
-            save_path = save_path,
-            mpnn_model = mpnn_model,
-            af2_binder_model = af2_binder_model,
-            af2_monomer_model = af2_monomer_model,
-        )
-        for result in (func(w) for w in work):
-            if result is not None:  
+        for i, result in enumerate(results_iter):
+            if result is not None:
                 final_results.append(result)
+            if i % save_every_n_iterations == 0:
+                pl.concat(final_results).collect().write_delta(metrics_save_filepath, mode = "append")
+                final_results = []
             tracker.update(task, advance = 1)
             af2_binder_model.restart()
             af2_monomer_model.restart()
-    pl.concat(final_results).sink_parquet(save_path / "metrics.parquet")
+        if final_results:
+            click.echo(f"Saving final results")
+            pl.concat(final_results).collect().write_delta(metrics_save_filepath, mode = "append")
     return 0
 
 
