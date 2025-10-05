@@ -17,9 +17,7 @@ import click
 
 from colabdesign import mk_afdesign_model
 from colabdesign.mpnn import mk_mpnn_model
-from colabdesign.af.alphafold.common import residue_constants 
 from colabdesign.shared.utils import clear_mem
-from colabdesign.af.loss import get_pae_loss
 
 import functools
 
@@ -88,23 +86,6 @@ def setup_af2_params() -> None:
     (path / "alphafold_params_2022-12-06.tar").unlink(missing_ok = True)
 
 
-def _process_metrics_from_aux(aux: dict[str, Any]) -> dict[str, float | None]:
-    return {
-        "plddt": aux["plddt"].mean(-1),
-        "pae": aux["pae"].mean(),
-        "ptm": aux["ptm"],
-        "rmsd": aux["losses"]["rmsd"],
-        "ipae": aux["losses"].get("i_pae", None),
-        "iptm": aux.get("i_ptm", None),
-    }
-
-
-def _process_batch_results(batch_results: dict[str, jax.Array], prefix: str | None = None) -> dict[str, np.ndarray]:
-    if prefix is None:
-        return {k: np.array(v) for k, v in batch_results.items() if v is not None}
-    return {f"{prefix}_{k}": np.array(v) for k, v in batch_results.items() if v is not None}
-
-
 def worker(
     work: tuple[str, Path, DictConfig],
     save_path: Path,
@@ -115,7 +96,6 @@ def worker(
     af2_monomer_model: mk_afdesign_model,
 ) -> pl.LazyFrame | None:
     design_name, structure_filepath, design_data = work
-    _tokenize_seq = lambda seq: [residue_constants.restype_order[aa] for aa in seq]
     if not structure_filepath.exists():
         click.echo(f"Structure `{structure_filepath}` was not found.")
         return None
@@ -161,6 +141,7 @@ def worker(
         chain = target_chain,
         binder_chain = binder_chain,
         use_binder_template = True,
+        rm_template_ic = True,
     )
     af2_monomer_model.prep_inputs(
         pdb_filename = str(structure_filepath),
@@ -232,6 +213,7 @@ def main(config_filepath: Path) -> int:
     if not save_path.exists():
         save_path.mkdir(parents = True)
     params_path = Path.home().joinpath(".cache")
+    clear_mem()
     mpnn_model = mk_mpnn_model(weights = config["proteinmpnn"]["weights"])
     af2_binder_model = mk_afdesign_model(
         protocol = "binder",
